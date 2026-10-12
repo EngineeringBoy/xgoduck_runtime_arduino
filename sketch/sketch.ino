@@ -75,10 +75,10 @@ static void receiveServo(MsgPack::bin_t<uint8_t> bytes) {
   bool valid = bytes.size() == sizeof(pkt);
   if (valid) {
     memcpy(&pkt, bytes.data(), sizeof(pkt));
-    valid = memcmp(pkt.magic, "DQV1", 4) == 0 && pkt.op <= SERVO_READ &&
-            pkt.targetId != 0 && pkt.targetId != 0xFE;
+    valid = memcmp(pkt.magic, "DQV1", 4) == 0 && pkt.op <= SERVO_PING &&
+            pkt.targetId <= 253;
     if (pkt.op == SERVO_GOTO) valid = valid && pkt.rawPos <= POS_MAX;
-    if (pkt.op == SERVO_SET_ID) valid = valid && pkt.newId != 0 && pkt.newId != 0xFE;
+    if (pkt.op == SERVO_SET_ID) valid = valid && pkt.newId <= 253;
   }
   k_mutex_lock(&hostMu, K_FOREVER);
   if (valid) { pendingServo = pkt; servoPending = true; }
@@ -169,6 +169,7 @@ static void applyServoOp(const ServoPacket &pkt) {
       break;
     case SERVO_SET_ID:
       if (hostMode != HOST_SERVO_DEBUG) { reply.ok = 0; break; }
+      setTorqueEnable(false);
       servoUnlock(pkt.targetId);
       k_msleep(2);
       servoSetId(pkt.targetId, pkt.newId);
@@ -186,9 +187,29 @@ static void applyServoOp(const ServoPacket &pkt) {
       k_msleep(2);
       servoSetPermKpKd(pkt.targetId, pkt.kp, pkt.kd);
       break;
+    case SERVO_PING: {
+      if (hostMode != HOST_SERVO_DEBUG) { reply.ok = 0; break; }
+      drainServoRx();
+      servoPingId = pkt.targetId;
+      servoPingSeen = false;
+      scsWriteBuf(pkt.targetId, 0x01, nullptr, 0);
+      Serial1.flush();
+      const uint32_t start = micros();
+      while ((uint32_t)(micros() - start) < SERVO_REPLY_US) {
+        parseServoRx();
+        k_sleep(K_USEC(100));
+      }
+      parseServoRx();
+      reply.ok = servoPingSeen ? 1 : 0;
+      servoPingId = 0xFF;
+      break;
+    }
     case SERVO_READ:
       if (hostMode != HOST_SERVO_DEBUG) { reply.ok = 0; break; }
       drainServoRx();
+      servoReadId = pkt.targetId;
+      servoReadSeen = false;
+      servoReadPos = 0;
       readSinglePresent(pkt.targetId);
       Serial1.flush();
       {
@@ -201,16 +222,13 @@ static void applyServoOp(const ServoPacket &pkt) {
       }
       {
         const int idx = motorIndexById(pkt.targetId);
+        reply.ok = servoReadSeen ? 1 : 0;
+        reply.rawPos = servoReadPos;
+        servoReadId = 0xFF;
         if (idx >= 0) {
           k_mutex_lock(&motorsMu, K_FOREVER);
-          reply.rawPos = motors[idx].fbPos;
           reply.zeroPos = motors[idx].zeroPos;
           k_mutex_unlock(&motorsMu);
-          reply.ok = (servoRxMask & (1u << idx)) ? 1 : 0;
-        } else {
-          // The ID is not in MOTOR_IDS yet. Bench programming still reports success.
-          reply.ok = 1;
-          reply.rawPos = 0;
         }
       }
       break;

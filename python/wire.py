@@ -14,6 +14,7 @@ DISARM, ARM, POLICY, HOLD = range(4)
 
 CAL_ENTER, CAL_EXIT, CAL_SET_RAW, CAL_FINISH_ONE, CAL_SET_ZEROS = range(5)
 SERVO_ENTER, SERVO_EXIT, SERVO_UNLOCK, SERVO_SET_ID, SERVO_GOTO, SERVO_SET_PERM_KP_KD, SERVO_READ = range(7)
+SERVO_PING = 7
 
 assert STATE.size == 240
 assert COMMAND.size == 80
@@ -91,10 +92,12 @@ def encode_cal(op, index=0, mask=ALL_MASK, raw=None):
     return CAL.pack(b'DQL1', op, index & 0xff, mask & 0xffff, *[int(v) & 0xffff for v in values])
 
 def encode_servo(op, target_id, new_id=0, kp=5, kd=20, raw_pos=2047):
-    if op not in range(7):
+    if op not in range(8):
         raise ValueError('invalid servo op')
-    if not 1 <= int(target_id) <= 253:
+    if not 0 <= int(target_id) <= 253:
         raise ValueError('invalid target id')
+    if op == SERVO_SET_ID and not 0 <= int(new_id) <= 253:
+        raise ValueError('invalid new id')
     if not 0 <= int(raw_pos) <= 4095:
         raise ValueError('raw out of range')
     return SERVO.pack(b'DQV1', op, int(target_id) & 0xff, int(new_id) & 0xff,

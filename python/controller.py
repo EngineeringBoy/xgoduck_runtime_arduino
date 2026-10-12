@@ -28,6 +28,7 @@ class Controller:
     def __init__(self, bridge):
         self.bridge = bridge
         self.lock = threading.RLock()
+        self.servo_op_lock = threading.Lock()
         self.policy_lock = threading.Lock()
         self.policy = Policy()
         ok, message = self.policy.load()
@@ -82,6 +83,7 @@ class Controller:
         self.raw_mask = 0
         self.servo_reply = None
         self.servo_reply_event = threading.Event()
+        self.servo_expected_reply = None
         self._zeros_pushed = False
         self._load_zeros()
 
@@ -135,6 +137,8 @@ class Controller:
         except ValueError:
             return
         with self.lock:
+            if self.servo_expected_reply != (pkt['op'], pkt['target_id']):
+                return
             self.servo_reply = pkt
             self.servo_reply_event.set()
 
@@ -347,6 +351,28 @@ class Controller:
         self.web_time = time.monotonic()
 
     def servo_op(self, action, target_id, new_id=None, kp=5, kd=20, raw_pos=2047):
+        with self.servo_op_lock:
+            if action != 'set_id':
+                return self._servo_op(action, target_id, new_id, kp, kd, raw_pos)
+            target_id, new_id = int(target_id), int(new_id)
+            if not 0 <= target_id <= 253 or not 0 <= new_id <= 253:
+                raise ValueError('ID must be between 0 and 253')
+            if not self._servo_op('ping', target_id)['ok']:
+                raise ValueError(f'No servo replied at ID {target_id}; ID was not changed')
+            if target_id == new_id:
+                return dict(ok=True, op=SERVO_SET_ID, target_id=target_id, new_id=new_id)
+            if self._servo_op('ping', new_id)['ok']:
+                raise ValueError(f'ID {new_id} is already in use; choose another ID')
+            # Keep the checks, write and verification in one serialized operation.
+            reply = self._servo_op(action, target_id, new_id, kp, kd, raw_pos)
+            time.sleep(0.05)
+            if not self._servo_op('ping', new_id)['ok']:
+                raise ValueError(f'ID write sent, but ID {new_id} did not reply. Scan again')
+            if self._servo_op('ping', target_id)['ok']:
+                raise ValueError('Both old and new IDs replied. Connect only one servo and scan again')
+            return dict(reply, new_id=new_id)
+
+    def _servo_op(self, action, target_id, new_id=None, kp=5, kd=20, raw_pos=2047):
         target_id = int(target_id)
         with self.lock:
             self._require_servo_debug()
@@ -354,7 +380,7 @@ class Controller:
                 op, payload = SERVO_UNLOCK, encode_servo(SERVO_UNLOCK, target_id)
             elif action == 'set_id':
                 new_id = int(new_id)
-                if not 1 <= new_id <= 253:
+                if not 0 <= new_id <= 253:
                     raise ValueError('invalid new id')
                 op, payload = SERVO_SET_ID, encode_servo(SERVO_SET_ID, target_id, new_id=new_id)
             elif action == 'goto':
@@ -368,20 +394,32 @@ class Controller:
                 payload = encode_servo(SERVO_SET_PERM_KP_KD, target_id, kp=kp, kd=kd)
             elif action == 'read':
                 op, payload = SERVO_READ, encode_servo(SERVO_READ, target_id)
+            elif action == 'ping':
+                op, payload = SERVO_PING, encode_servo(SERVO_PING, target_id)
+            elif action == 'torque_off':
+                op, payload = SERVO_ENTER, encode_servo(SERVO_ENTER, target_id)
             else:
                 raise ValueError('unknown servo action')
             self.servo_reply_event.clear()
+            self.servo_reply = None
+            self.servo_expected_reply = (op, target_id)
+        try:
             self.bridge.notify('duck_servo', payload)
-        return self._wait_servo_reply(op)
+            return self._wait_servo_reply(op, target_id=target_id)
+        finally:
+            with self.lock:
+                self.servo_expected_reply = None
 
-    def _wait_servo_reply(self, op, timeout=0.5):
+    def _wait_servo_reply(self, op, timeout=0.5, target_id=None):
         if not self.servo_reply_event.wait(timeout):
             raise ValueError('servo reply timeout')
         with self.lock:
             reply = self.servo_reply
         if not reply or reply['op'] != op:
             raise ValueError('unexpected servo reply')
-        if not reply['ok']:
+        if target_id is not None and reply['target_id'] != target_id:
+            raise ValueError('unexpected servo reply ID')
+        if not reply['ok'] and op != SERVO_PING:
             raise ValueError('servo operation failed')
         return reply
 
@@ -589,6 +627,7 @@ class Controller:
                 factory_zero_pos=list(FACTORY_ZERO), cal_done=list(self.cal_done),
                 cal_targets=list(self.cal_targets), raw_mask=self.raw_mask)
             result['control_ready']=bool(fb and fb.imu_ok and now-self.rx_time<.15 and self.mode not in EXCLUSIVE_MODES)
+            result['servo_scan_version'] = 1
             result['deployment'] = dict(reference='rl/raspi_deploy', control_hz=50,
                 home_deg=HOME_DEG.tolist(), default_deg=DEFAULT_DEG,
                 action_scale=self.policy.action_scale, action_alpha=self.policy.action_alpha,

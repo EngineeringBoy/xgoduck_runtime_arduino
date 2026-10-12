@@ -11,6 +11,13 @@ static uint8_t servoParserFlag = 0;
 static uint8_t servoRxBuffer[32];
 static uint8_t servoRxLen = 0;
 static uint8_t servoRxDataLen = 0;
+// Only the hardware task accesses these per-request results. 0xFF means idle;
+// ID 0 is a valid servo address, just like IDs 1..253.
+static uint8_t servoPingId = 0xFF;
+static bool servoPingSeen = false;
+static uint8_t servoReadId = 0xFF;
+static bool servoReadSeen = false;
+static uint16_t servoReadPos = 0;
 
 static int motorIndexById(uint8_t id) {
   for (uint8_t i = 0; i < NUM_MOTORS; i++) {
@@ -228,7 +235,7 @@ static void parseServoRx() {
         break;
       case 3:
         servoRxBuffer[3] = res;
-        if (res == 0x04 || res == 0x08 || res == 0x09 || res == 0x0B) {
+        if (res == 0x02 || res == 0x04 || res == 0x08 || res == 0x09 || res == 0x0B) {
           servoParserFlag = 4;
           servoRxLen = 0;
           servoRxDataLen = res;
@@ -255,6 +262,11 @@ static void parseServoRx() {
           }
           uint8_t sid = servoRxBuffer[2];
           uint8_t dataLen = servoRxDataLen;
+          if (dataLen == 2 && servoPingId <= 253 && sid == servoPingId) {
+            // Even a device error is evidence that this address responded.
+            servoPingSeen = true;
+            break;
+          }
           const int idx = motorIndexById(sid);
           if (dataLen == 4 && servoRxBuffer[4] == 0 && idx >= 0) {
             servoBootP[idx]=servoRxBuffer[5]; servoBootD[idx]=servoRxBuffer[6];
@@ -262,8 +274,12 @@ static void parseServoRx() {
             break;
           }
           // Only accept the requested 6-byte status, with no device error.
-          if (dataLen != 8 || servoRxBuffer[4] != 0 || idx < 0) {
+          if (dataLen != 8 || servoRxBuffer[4] != 0) {
             break;
+          }
+          if (servoReadId <= 253 && sid == servoReadId) {
+            servoReadSeen = true;
+            servoReadPos = (uint16_t)hostWord(servoRxBuffer[5], servoRxBuffer[6]);
           }
           applyMotorFb(sid, hostWord(servoRxBuffer[5], servoRxBuffer[6]),
                        hostVelSignMag(servoRxBuffer[7], servoRxBuffer[8]));
