@@ -1,22 +1,14 @@
 """100Hz receive/filter callback and independent 50Hz ONNX loop."""
 import collections
-import json
 import math
 import threading
 import time
-from pathlib import Path
 from policy import Policy
 from recovery import Recovery
 from proc import SignalFilter
 from rl_core import MOTOR_IDS, HOME_DEG, DEFAULT_DEG, GRAVITY_TAU, IMU_BIAS_DEG, MOUTH_INDEX, MOUTH_MAX_DEG
 from wire import *
 
-FACTORY_ZERO = [
-    2236, 2005, 1912, 1866, 1945,
-    2127, 2135, 1914, 2228, 2206,
-    2550, 2060, 2128, 2034, 2190,
-]
-ZERO_PATH = Path(__file__).resolve().parents[1] / 'data' / 'zero_pos.json'
 EXCLUSIVE_MODES = ('calibrate', 'servo_debug')
 PICK_PERIOD_S = 4.0
 PICK_MOUTH_CLOSE_PHI = 0.4
@@ -29,6 +21,7 @@ class Controller:
         self.bridge = bridge
         self.lock = threading.RLock()
         self.servo_op_lock = threading.Lock()
+        self.cal_op_lock = threading.Lock()
         self.policy_lock = threading.Lock()
         self.policy = Policy()
         ok, message = self.policy.load()
@@ -76,40 +69,16 @@ class Controller:
         self.last_action = [0.0]*15
         self.started = time.monotonic()
         self.boot_pd = {}
-        self.raw_pos = list(FACTORY_ZERO)
-        self.zero_pos = list(FACTORY_ZERO)
+        self.raw_pos = [SERVO_CENTER_POS]*15
         self.cal_done = [False]*15
-        self.cal_targets = [2047]*15
+        self.cal_reply = None
+        self.cal_seq = 0
+        self.cal_reply_event = threading.Event()
+        self.cal_expected_index = None
         self.raw_mask = 0
         self.servo_reply = None
         self.servo_reply_event = threading.Event()
         self.servo_expected_reply = None
-        self._zeros_pushed = False
-        self._load_zeros()
-
-    def _load_zeros(self):
-        try:
-            data = json.loads(ZERO_PATH.read_text(encoding='utf-8'))
-            values = [int(v) for v in data['zero_pos']]
-            if len(values) != 15 or any(not 0 <= v <= 4095 for v in values):
-                return
-            self.zero_pos = values
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            pass
-
-    def _save_zeros(self):
-        ZERO_PATH.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            'version': 1,
-            'ids': list(MOTOR_IDS),
-            'zero_pos': list(self.zero_pos),
-            'saved_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-        }
-        ZERO_PATH.write_text(json.dumps(payload, indent=2), encoding='utf-8')
-
-    def _push_zeros(self):
-        self.bridge.notify('duck_cal', encode_cal(CAL_SET_ZEROS, mask=ALL_MASK, raw=self.zero_pos))
-        self._zeros_pushed = True
 
     def receive_boot_pd(self, raw):
         if not isinstance(raw, (bytes, bytearray)) or len(raw)!=32: return
@@ -123,13 +92,21 @@ class Controller:
         except ValueError:
             return
         with self.lock:
-            if not self._zeros_pushed:
-                self._push_zeros()
             self.raw_pos = pkt['pos']
             self.raw_mask = pkt['mask']
-            # After a push settles, trust MCU zeros; until then keep file values.
-            if self._zeros_pushed:
-                self.zero_pos = pkt['zero']
+            self.cal_done = [self.mode == 'calibrate' and bool(pkt['held_mask'] & (1 << i))
+                             for i in range(15)]
+
+    def receive_cal_reply(self, raw):
+        try:
+            reply = decode_cal_reply(raw)
+        except ValueError:
+            return
+        with self.lock:
+            if self.cal_expected_index != (reply['seq'], reply['index']):
+                return
+            self.cal_reply = reply
+            self.cal_reply_event.set()
 
     def receive_servo_reply(self, raw):
         try:
@@ -159,7 +136,9 @@ class Controller:
                     self.arm_pending = False; self.filter.reset()
                     self.recovery.reset(); self.policy_needs_reset = True
                     self._stop_pick_locked(); self._stop_roulade_locked()
-                    self._zeros_pushed = False
+                    self.cal_done = [False]*15
+                    self.cal_expected_index = None
+                    self.cal_reply_event.set()
                 else:
                     self.gaps += step-1
                 self.rx_intervals.append((now-self.rx_time)*1000)
@@ -186,12 +165,12 @@ class Controller:
         if mode not in ('shadow', 'off', 'hold', 'policy', 'calibrate', 'servo_debug'):
             raise ValueError('unknown mode')
         with self.lock:
-            if mode == self.mode:
+            if mode == self.mode and mode != 'calibrate':
                 self.web_time = time.monotonic()
                 return {'mode': self.mode}
             if mode in ('hold', 'policy') and self.mode in EXCLUSIVE_MODES:
                 raise ValueError('exit calibrate/servo_debug first')
-            if mode in EXCLUSIVE_MODES and self.mode in ('hold', 'policy'):
+            if mode == 'servo_debug' and self.mode in ('hold', 'policy'):
                 raise ValueError('disarm before calibrate/servo_debug')
             fb = None
             if mode in ('hold', 'policy'):
@@ -206,13 +185,16 @@ class Controller:
             self.arm_pending = fb is not None and not fb.enabled
             if previous == 'calibrate' and mode != 'calibrate':
                 self.cal_done = [False]*15
+                self.cal_expected_index = None
+                self.cal_reply_event.set()
                 self.bridge.notify('duck_cal', encode_cal(CAL_EXIT))
             if previous == 'servo_debug' and mode != 'servo_debug':
                 self.bridge.notify('duck_servo', encode_servo(SERVO_EXIT, 10))
             if mode == 'calibrate':
                 self._disarm_now()
-                self.cal_targets = [2047]*15
                 self.cal_done = [False]*15
+                self.cal_expected_index = None
+                self.cal_reply_event.set()
                 self.bridge.notify('duck_cal', encode_cal(CAL_ENTER))
             elif mode == 'servo_debug':
                 self._disarm_now()
@@ -317,43 +299,54 @@ class Controller:
             self.web_time = time.monotonic()
         return {'ok': True}
 
-    def cal_targets_set(self, targets):
-        values = [int(v) for v in targets]
-        if len(values) != 15 or any(not 0 <= v <= 4095 for v in values):
-            raise ValueError('15 raw targets in 0..4095 required')
+    def cal_heartbeat(self):
         with self.lock:
             if self.mode != 'calibrate':
                 raise ValueError('not in calibrate mode')
-            self.cal_targets = values
             self.web_time = time.monotonic()
-            self.bridge.notify('duck_cal', encode_cal(CAL_SET_RAW, mask=ALL_MASK, raw=values))
-        return {'ok': True, 'targets': values}
+        return {'ok': True}
 
-    def cal_finish(self, index):
-        index = int(index)
-        if not 0 <= index < 15:
+    def cal_center(self, index):
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 15:
             raise ValueError('joint index out of range')
-        with self.lock:
-            if self.mode != 'calibrate':
-                raise ValueError('not in calibrate mode')
-            self.bridge.notify('duck_cal', encode_cal(CAL_FINISH_ONE, index=index))
-            # Optimistically store the last reported encoder reading.
-            self.zero_pos[index] = int(self.raw_pos[index])
-            self.cal_done[index] = True
-            self._save_zeros()
-            self.web_time = time.monotonic()
-            return {'ok': True, 'index': index, 'zero_pos': self.zero_pos[index],
-                    'cal_done': list(self.cal_done)}
+        with self.cal_op_lock:
+            with self.lock:
+                if self.mode != 'calibrate':
+                    raise ValueError('not in calibrate mode')
+                if not self.feedback or time.monotonic()-self.rx_time > .15:
+                    raise ValueError('MCU feedback is stale')
+                generation = self.generation
+                self.cal_seq = (self.cal_seq + 1) & 0xffffffff
+                seq = self.cal_seq
+                self.web_time = time.monotonic()
+                self.cal_reply = None
+                self.cal_reply_event.clear()
+                self.cal_expected_index = (seq, index)
+            try:
+                self.bridge.notify('duck_cal', encode_cal(CAL_CENTER_ONE, index=index, seq=seq))
+                if not self.cal_reply_event.wait(.75):
+                    raise ValueError('centering acknowledgement timeout')
+                with self.lock:
+                    if self.mode != 'calibrate' or self.generation != generation:
+                        raise ValueError('calibration session changed')
+                    if not self.cal_reply or not self.cal_reply['ok']:
+                        raise ValueError(f'No servo replied at ID {MOTOR_IDS[index]}; centering was not started')
+                    self.web_time = time.monotonic()
+                return {'ok': True, 'index': index, 'id': MOTOR_IDS[index], 'hold_pos': CAL_HOLD_POS}
+            finally:
+                with self.lock:
+                    self.cal_expected_index = None
 
     def _require_servo_debug(self):
         if self.mode != 'servo_debug':
             raise ValueError('not in servo_debug mode')
         self.web_time = time.monotonic()
 
-    def servo_op(self, action, target_id, new_id=None, kp=5, kd=20, raw_pos=2047):
+    def servo_op(self, action, target_id=None, new_id=None, kp=5, kd=20, *, protection_enabled=True, current_a=1.0):
         with self.servo_op_lock:
             if action != 'set_id':
-                return self._servo_op(action, target_id, new_id, kp, kd, raw_pos)
+                return self._servo_op(action, target_id, new_id, kp, kd,
+                                      protection_enabled=protection_enabled, current_a=current_a)
             target_id, new_id = int(target_id), int(new_id)
             if not 0 <= target_id <= 253 or not 0 <= new_id <= 253:
                 raise ValueError('ID must be between 0 and 253')
@@ -364,7 +357,7 @@ class Controller:
             if self._servo_op('ping', new_id)['ok']:
                 raise ValueError(f'ID {new_id} is already in use; choose another ID')
             # Keep the checks, write and verification in one serialized operation.
-            reply = self._servo_op(action, target_id, new_id, kp, kd, raw_pos)
+            reply = self._servo_op(action, target_id, new_id, kp, kd)
             time.sleep(0.05)
             if not self._servo_op('ping', new_id)['ok']:
                 raise ValueError(f'ID write sent, but ID {new_id} did not reply. Scan again')
@@ -372,8 +365,13 @@ class Controller:
                 raise ValueError('Both old and new IDs replied. Connect only one servo and scan again')
             return dict(reply, new_id=new_id)
 
-    def _servo_op(self, action, target_id, new_id=None, kp=5, kd=20, raw_pos=2047):
-        target_id = int(target_id)
+    def _servo_op(self, action, target_id, new_id=None, kp=5, kd=20, *, protection_enabled=True, current_a=1.0):
+        if action in ('set_protection', 'set_protection_current'):
+            if target_id is not None and target_id != BROADCAST_ID:
+                raise ValueError('protection applies to all servos; target must be broadcast')
+            target_id = BROADCAST_ID
+        else:
+            target_id = int(target_id)
         with self.lock:
             self._require_servo_debug()
             if action == 'unlock':
@@ -383,15 +381,20 @@ class Controller:
                 if not 0 <= new_id <= 253:
                     raise ValueError('invalid new id')
                 op, payload = SERVO_SET_ID, encode_servo(SERVO_SET_ID, target_id, new_id=new_id)
-            elif action == 'goto':
-                raw_pos = int(raw_pos)
-                op, payload = SERVO_GOTO, encode_servo(SERVO_GOTO, target_id, raw_pos=raw_pos)
+            elif action == 'reset_mid':
+                op, payload = SERVO_RESET_MID, encode_servo(SERVO_RESET_MID, target_id)
             elif action == 'set_gains':
                 kp, kd = int(kp), int(kd)
                 if not 0 <= kp <= 255 or not 0 <= kd <= 255:
                     raise ValueError('kp/kd out of range')
                 op = SERVO_SET_PERM_KP_KD
                 payload = encode_servo(SERVO_SET_PERM_KP_KD, target_id, kp=kp, kd=kd)
+            elif action == 'set_protection':
+                op = SERVO_SET_PROTECTION
+                payload = encode_servo_protection(protection_enabled)
+            elif action == 'set_protection_current':
+                op = SERVO_SET_PROTECTION_CURRENT
+                payload = encode_servo_protection_current(current_a)
             elif action == 'read':
                 op, payload = SERVO_READ, encode_servo(SERVO_READ, target_id)
             elif action == 'ping':
@@ -432,7 +435,8 @@ class Controller:
                 if not fb or age>.15 or not fb.imu_ok:
                     lost = 'sensor feedback lost; disarmed'
                 elif time.monotonic()-self.web_time > 1.0:
-                    lost = 'web heartbeat lost; disarmed'
+                    # Browser inactivity stops travel without releasing torque.
+                    self.twist = [0.0]*3
                 if lost:
                     self.mode = mode = 'shadow'; self.generation += 1
                     self.arm_pending = False; self.last_error = lost
@@ -447,6 +451,8 @@ class Controller:
                     generation = self.generation
                     if previous == 'calibrate':
                         self.cal_done = [False]*15
+                        self.cal_expected_index = None
+                        self.cal_reply_event.set()
                         self.bridge.notify('duck_cal', encode_cal(CAL_EXIT))
                     else:
                         self.bridge.notify('duck_servo', encode_servo(SERVO_EXIT, 10))
@@ -595,6 +601,8 @@ class Controller:
             self.mode = 'off'; self.generation += 1; self.arm_pending = False
             if previous == 'calibrate':
                 self.cal_done = [False]*15
+                self.cal_expected_index = None
+                self.cal_reply_event.set()
                 self.bridge.notify('duck_cal', encode_cal(CAL_EXIT))
             elif previous == 'servo_debug':
                 self.bridge.notify('duck_servo', encode_servo(SERVO_EXIT, 10))
@@ -623,11 +631,10 @@ class Controller:
                 uptime_s=now-self.started, last_error=self.last_error, command=self.twist,
                 head=self.head, mouth=self.mouth, policy_targets=self.last_action, motors=MOTOR_IDS, boot_pd=self.boot_pd,
                 full_robot_ready=bool(fb and fb.imu_ok and fb.mask==ALL_MASK and now-self.rx_time<.15),
-                raw_pos=list(self.raw_pos), zero_pos=list(self.zero_pos),
-                factory_zero_pos=list(FACTORY_ZERO), cal_done=list(self.cal_done),
-                cal_targets=list(self.cal_targets), raw_mask=self.raw_mask)
+                raw_pos=list(self.raw_pos), encoder_center=SERVO_CENTER_POS,
+                cal_done=list(self.cal_done), cal_hold_pos=CAL_HOLD_POS, raw_mask=self.raw_mask)
             result['control_ready']=bool(fb and fb.imu_ok and now-self.rx_time<.15 and self.mode not in EXCLUSIVE_MODES)
-            result['servo_scan_version'] = 1
+            result['servo_scan_version'] = 2
             result['deployment'] = dict(reference='rl/raspi_deploy', control_hz=50,
                 home_deg=HOME_DEG.tolist(), default_deg=DEFAULT_DEG,
                 action_scale=self.policy.action_scale, action_alpha=self.policy.action_alpha,

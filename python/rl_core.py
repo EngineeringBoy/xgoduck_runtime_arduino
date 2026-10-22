@@ -27,10 +27,10 @@ MOTOR_IDS = [
     30, 31, 32, 33, 34,
 ]
 
-q = 23.0
+# The default pose is maintained here only, in MOTOR_IDS order.
 DEFAULT_DEG = [
-    0.0, -5.0, -q, 0.0, q,
-    0.0, 5.0, q, 0.0, -q,
+    0.0, -5.0, -22.0, 0.0, 22.0,
+    0.0, 5.0, 22.0, 0.0, -22.0,
     20.0, 20.0, 0.0, 0.0, 0.0,
 ]
 
@@ -56,7 +56,7 @@ ACTION_SCALE = 1.0
 
 ACTION_ALPHA = 0.45
 
-ACTION_ALPHA_HEAD = 0.45
+ACTION_ALPHA_HEAD = 0.2
 
 @dataclass
 class State:

@@ -10,18 +10,23 @@ $('pick').onclick=async()=>{try{const r=await post('pick',{});$('message').textC
 $('roulade').onclick=async()=>{try{const r=await post('roulade',{});$('message').textContent=`Roulade · ${r.model}`;}catch(e){showError(e);}};
 $('stop').onclick=()=>{zero();setMode('off')};
 const keys=new Set(), sticks={left:{x:0,y:0},right:{x:0,y:0}}, resetSticks=[];
-let motion=[0,0,0];
-const deadzone=v=>Math.abs(v)<.1?0:v;
+let motion=[0,0,0], targetMotion=[0,0,0];
+const deadzone=v=>Math.abs(v)<=.15?0:v;
 function updateMotion(){
   const key=(a,b)=>keys.has(a)-keys.has(b);
-  motion=[keys.has('w')||keys.has('s')?key('w','s')*.2:deadzone(sticks.left.y)*.4,
+  const forward=deadzone(sticks.left.y);
+  targetMotion=[keys.has('w')||keys.has('s')?key('w','s')*.2:forward*(forward<0?.2:.4),
     keys.has('a')||keys.has('d')?key('a','d')*.15:deadzone(-sticks.left.x)*.3,
     keys.has('q')||keys.has('e')?key('q','e')*.5:deadzone(-sticks.right.x)];
+}
+function showMotion(){
   ['vx','vy','wz'].forEach((id,i)=>$(id+'Value').textContent=motion[i].toFixed(2));
 }
 async function sendCommand(){
   if(commandBusy){commandPending=true;return;}
   commandBusy=true;commandPending=false;
+  motion=motion.map((old,i)=>.3*old+.7*targetMotion[i]);
+  showMotion();
   try{await post('command',{twist:[...motion],head:[0,1,2,3].map(i=>+$('head'+i).value),mouth:+$('mouth').value});}
   catch(e){showError(e);}
   finally{commandBusy=false;if(commandPending)sendCommand();}
@@ -49,15 +54,18 @@ function joystick(id,side){
   zone.onpointerup=zone.onpointercancel=zone.onlostpointercapture=release;
 }
 joystick('joy-left','left');joystick('joy-right','right');
-function zero(){keys.clear();resetSticks.forEach(reset=>reset());updateMotion();sendCommand();}
-$('zero').onclick=zero;
+function zero(send=true){keys.clear();resetSticks.forEach(reset=>reset());motion=[0,0,0];updateMotion();showMotion();if(send)sendCommand();}
+$('zero').onclick=()=>zero();
 ['leg-alpha','head-alpha'].forEach(id=>$(id).onchange=()=>post('filter',{leg:+$('leg-alpha').value,head:+$('head-alpha').value}).catch(showError));
 function keyCommand(){updateMotion();sendCommand();}
 window.addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();$('stop').click();return;}const k=e.key.toLowerCase();if('wasdqe'.includes(k)&&k.length===1){keys.add(k);keyCommand();}});
 window.addEventListener('keyup',e=>{const k=e.key.toLowerCase();if(keys.delete(k))keyCommand();});
-window.addEventListener('blur',()=>{keys.clear();zero();});
-document.addEventListener('visibilitychange',()=>{if(document.hidden){keys.clear();zero();post('mode',{mode:'off'}).catch(()=>{});}});
-window.addEventListener('pagehide',()=>navigator.sendBeacon('/api/mode',new Blob([JSON.stringify({mode:'off'})],{type:'application/json'})));
+window.addEventListener('blur',()=>zero());
+document.addEventListener('visibilitychange',()=>{if(document.hidden)zero();});
+window.addEventListener('pagehide',()=>{
+  zero(false);
+  navigator.sendBeacon('/api/command',new Blob([JSON.stringify({twist:[0,0,0]})],{type:'application/json'}));
+});
 setInterval(()=>{if(!document.hidden&&!commandBusy)sendCommand();},50);
 setInterval(async()=>{if(statusBusy||document.hidden)return;statusBusy=true;try{const r=await fetch('/api/status');if(!r.ok)throw new Error('status read failed');const s=await r.json();const modeLabel={shadow:'inference only',off:'torque off',hold:'default pose',policy:'walk',calibrate:'calibrate',servo_debug:'servo setup'};$('rx').textContent=s.feedback_hz.toFixed(1)+' Hz';$('rl').textContent=s.inference_hz.toFixed(1)+' Hz';$('servos').textContent=(s.servo_ids?.length||0)+'/15';$('imu').textContent=s.imu_ok?'online':'offline';$('mode').textContent=(modeLabel[s.mode]||s.mode)+(s.enabled?' · enabled':' · torque off');$('message').textContent=s.last_error||`Bridge ${(s.bridge_baud/1e6).toFixed(0)} Mbps · state age ${(s.feedback_age_ms||0).toFixed(1)} ms`;
 document.querySelectorAll('[data-mode="hold"],[data-mode="policy"]').forEach(b=>b.disabled=!s.control_ready);

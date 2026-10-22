@@ -12,9 +12,7 @@ enum HostBusMode : uint8_t { HOST_NORMAL = 0, HOST_CAL = 1, HOST_SERVO_DEBUG = 2
 enum CalOp : uint8_t {
   CAL_ENTER = 0,
   CAL_EXIT = 1,
-  CAL_SET_RAW = 2,
-  CAL_FINISH_ONE = 3,
-  CAL_SET_ZEROS = 4
+  CAL_CENTER_ONE = 2
 };
 
 enum ServoOp : uint8_t {
@@ -22,10 +20,13 @@ enum ServoOp : uint8_t {
   SERVO_EXIT = 1,
   SERVO_UNLOCK = 2,
   SERVO_SET_ID = 3,
-  SERVO_GOTO = 4,
+  // 4 was the removed arbitrary-position operation.
   SERVO_SET_PERM_KP_KD = 5,
   SERVO_READ = 6,
-  SERVO_PING = 7
+  SERVO_PING = 7,
+  SERVO_RESET_MID = 8,
+  SERVO_SET_PROTECTION = 9,
+  SERVO_SET_PROTECTION_CURRENT = 10
 };
 
 // Little endian, binary payload inside MessagePack RPC. ABI shared with wire.py.
@@ -47,30 +48,37 @@ struct __attribute__((packed)) StatePacket {
 };
 struct __attribute__((packed)) CalPacket {
   char magic[4];
+  uint32_t seq;
   uint8_t op, index;
-  uint16_t mask;
-  uint16_t raw[15];
+};
+struct __attribute__((packed)) CalReplyPacket {
+  char magic[4];
+  uint32_t seq;
+  uint8_t index, ok;
 };
 struct __attribute__((packed)) ServoPacket {
   char magic[4];
-  uint8_t op, targetId, newId, kp, kd, reserved;
-  uint16_t rawPos;
+  uint8_t op, targetId, newId, kp, kd;
+  union { uint8_t reserved; uint8_t protectionFlags; };
+  union { uint16_t reserved2; uint16_t protectionCurrent; };
 };
 struct __attribute__((packed)) RawPacket {
   char magic[4];
-  uint16_t mask;
+  uint16_t mask, heldMask;
   uint16_t pos[15];
-  uint16_t zero[15];
 };
 struct __attribute__((packed)) ServoReplyPacket {
   char magic[4];
-  uint8_t op, targetId, ok, reserved;
-  uint16_t rawPos;
-  uint16_t zeroPos;
+  uint8_t op, targetId, ok;
+  union { uint8_t reserved; uint8_t protectionFlags; };
+  union { uint16_t rawPos; uint16_t protectionCurrent; };
+  uint16_t centerPos;
+  uint8_t kp, kd;
 };
 static_assert(sizeof(CommandPacket) == 80, "Command ABI");
 static_assert(sizeof(StatePacket) == 240, "State ABI");
-static_assert(sizeof(CalPacket) == 38, "Cal ABI");
+static_assert(sizeof(CalPacket) == 10, "Cal ABI");
+static_assert(sizeof(CalReplyPacket) == 10, "Cal reply ABI");
 static_assert(sizeof(ServoPacket) == 12, "Servo ABI");
-static_assert(sizeof(RawPacket) == 66, "Raw ABI");
-static_assert(sizeof(ServoReplyPacket) == 12, "Servo reply ABI");
+static_assert(sizeof(RawPacket) == 38, "Raw ABI");
+static_assert(sizeof(ServoReplyPacket) == 14, "Servo reply ABI");
