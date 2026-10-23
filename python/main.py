@@ -23,6 +23,10 @@ def mode(body: dict):
     try: return controller.set_mode(body['mode'])
     except (KeyError, ValueError) as exc: raise HTTPException(400, str(exc))
 
+def roller(body: dict):
+    try: return controller.set_roller_mode(body['enabled'])
+    except (KeyError, ValueError) as exc: raise HTTPException(400, str(exc))
+
 def command(body: dict):
     try: return controller.command(**body)
     except (TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
@@ -31,6 +35,14 @@ def filtering(body: dict):
     try:
         leg, head = controller.set_action_alphas(**body)
         return {'leg':leg,'head':head}
+    except (TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
+
+def imu_filtering(body: dict):
+    try: return controller.set_imu_filters(**body)
+    except (TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
+
+def action_scale(body: dict):
+    try: return controller.set_action_scale(**body)
     except (TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
 
 def pick(_body: dict = None):
@@ -76,8 +88,11 @@ def servo_action(body: dict):
 
 ui.expose_api('GET', '/api/status', controller.status)
 ui.expose_api('POST', '/api/mode', mode)
+ui.expose_api('POST', '/api/roller', roller)
 ui.expose_api('POST', '/api/command', command)
 ui.expose_api('POST', '/api/filter', filtering)
+ui.expose_api('POST', '/api/imu-filter', imu_filtering)
+ui.expose_api('POST', '/api/action-scale', action_scale)
 ui.expose_api('POST', '/api/pick', pick)
 ui.expose_api('POST', '/api/roulade', roulade)
 ui.expose_api('POST', '/api/cal/enter', cal_enter)

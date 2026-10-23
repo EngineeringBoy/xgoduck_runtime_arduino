@@ -6,7 +6,7 @@ import time
 from policy import Policy
 from recovery import Recovery
 from proc import SignalFilter
-from rl_core import MOTOR_IDS, HOME_DEG, DEFAULT_DEG, GRAVITY_TAU, IMU_BIAS_DEG, MOUTH_INDEX, MOUTH_MAX_DEG
+from rl_core import MOTOR_IDS, IMU_BIAS_DEG, MOUTH_INDEX, MOUTH_MAX_DEG
 from wire import *
 
 EXCLUSIVE_MODES = ('calibrate', 'servo_debug')
@@ -28,6 +28,15 @@ class Controller:
         if not ok:
             raise RuntimeError(message)
         self.model_message = message
+        self.walk_policy = self.policy
+        self.roller_policy = Policy()
+        ok, message = self.roller_policy.load('xgoduck_roller.onnx', use_model_home=True)
+        if not ok:
+            raise RuntimeError(message)
+        self.roller_policy.action_scale = 0.7
+        self.roller_policy.set_action_alphas(leg=0.4, head=0.5)
+        self.model_message += '; ' + message
+        self.roller_mode = False
         self.getup_policy = Policy()
         ok, message = self.getup_policy.load('xgoduck_getup.onnx')
         if not ok:
@@ -159,7 +168,7 @@ class Controller:
         self.arm_pending = False
         self.seq = (self.seq + 1) & 0xffffffff
         sample = self.feedback.sample_us if self.feedback else 0
-        self.bridge.notify('duck_command', encode_command(self.seq, sample, DISARM, DEFAULT_DEG))
+        self.bridge.notify('duck_command', encode_command(self.seq, sample, DISARM, self.policy.default_deg))
 
     def set_mode(self, mode):
         if mode not in ('shadow', 'off', 'hold', 'policy', 'calibrate', 'servo_debug'):
@@ -202,29 +211,68 @@ class Controller:
             elif previous in EXCLUSIVE_MODES:
                 self._disarm_now()
         with self.policy_lock:
-            self.policy.reset_action_filter()
-            self.getup_policy.reset_action_filter()
-            self.pick_policy.reset_action_filter()
-            self.roulade_policy.reset_action_filter()
+            for model in self._models():
+                model.reset_action_filter()
         return {'mode': mode}
 
+    def set_roller_mode(self, enabled):
+        if not isinstance(enabled, bool):
+            raise ValueError('roller enabled must be true or false')
+        with self.lock:
+            if enabled != self.roller_mode:
+                with self.policy_lock:
+                    self.policy = self.roller_policy if enabled else self.walk_policy
+                    self.policy.reset_action_filter()
+                    self.policy.warm(1)
+                self.roller_mode = enabled
+                # Drop any action computed by the previously selected walk model.
+                self.generation += 1
+                if (self.recovery.phase == 'walk' and not self.pick_active
+                        and not self._roulade_on(time.monotonic())):
+                    self.policy_needs_reset = True
+                self.twist = [0.0]*3
+                self.web_time = time.monotonic()
+            return dict(enabled=self.roller_mode, model=self.policy.file,
+                        action_scale=self.policy.action_scale, action_alpha=self.policy.action_alpha,
+                        action_alpha_head=self.policy.action_alpha_head)
+
     def _models(self):
-        return (self.policy, self.getup_policy, self.pick_policy, self.roulade_policy)
+        return (self.walk_policy, self.roller_policy, self.getup_policy, self.pick_policy, self.roulade_policy)
+
+    def _standard_models(self):
+        return (self.walk_policy, self.getup_policy, self.pick_policy, self.roulade_policy)
 
     def _apply_alphas_locked(self, leg, head):
-        for model in self._models():
+        for model in self._standard_models():
             model.set_action_alphas(leg=leg, head=head)
 
     def set_action_alphas(self, **values):
         with self.lock:
             with self.policy_lock:
-                leg, head = self.policy.set_action_alphas(**values)
+                if self.roller_mode:
+                    return self.roller_policy.set_action_alphas(**values)
+                leg, head = self.walk_policy.set_action_alphas(**values)
                 if self._roulade_alpha is not None:
                     self._roulade_alpha = (leg, head)
                     self._apply_alphas_locked(ROULADE_ALPHA, ROULADE_ALPHA)
                 else:
                     self._apply_alphas_locked(leg, head)
                 return leg, head
+
+    def set_imu_filters(self, **values):
+        with self.lock:
+            return self.filter.set_imu_filters(**values)
+
+    def set_action_scale(self, scale):
+        scale = float(scale)
+        if not math.isfinite(scale) or not 0 <= scale <= 2:
+            raise ValueError('action scale must be within [0,2]')
+        with self.lock:
+            with self.policy_lock:
+                models = (self.roller_policy,) if self.roller_mode else self._standard_models()
+                for model in models:
+                    model.action_scale = scale
+        return {'scale': scale}
 
     def _stop_pick_locked(self):
         self.pick_active = False
@@ -265,7 +313,7 @@ class Controller:
             if self.recovery.phase != 'walk' or self.pick_active:
                 raise ValueError('roulade only while walking')
             if self._roulade_alpha is None:
-                self._roulade_alpha = (self.policy.action_alpha, self.policy.action_alpha_head)
+                self._roulade_alpha = (self.walk_policy.action_alpha, self.walk_policy.action_alpha_head)
             self.roulade_until = time.monotonic() + ROULADE_S
             self.policy_needs_reset = True
             self.web_time = time.monotonic()
@@ -497,7 +545,7 @@ class Controller:
             exclusive = mode in EXCLUSIVE_MODES
         if exclusive:
             return
-        target = list(DEFAULT_DEG)
+        target = self.policy.default_deg
         if inferring and phase == 'default_pose':
             # Switch to getup immediately, but force action/history to zero for 1 s.
             with self.policy_lock:
@@ -547,7 +595,7 @@ class Controller:
             self.sent += 1
 
     def _keep_warm_idle(self):
-        """Run one dummy pass on an idle session so walk/getup/pick/roulade stay hot."""
+        """Run one dummy pass on an idle session so all policy sessions stay hot."""
         with self.lock:
             phase = self.recovery.phase
             rolling = self._roulade_on(time.monotonic()) and phase == 'walk'
@@ -560,7 +608,7 @@ class Controller:
                 active = self.policy
             else:
                 active = self.getup_policy
-            candidates = [p for p in (self.policy, self.getup_policy, self.pick_policy, self.roulade_policy) if p is not active]
+            candidates = [p for p in self._models() if p is not active]
         if not candidates:
             return
         self._warm_index = (self._warm_index + 1) % len(candidates)
@@ -607,7 +655,7 @@ class Controller:
             elif previous == 'servo_debug':
                 self.bridge.notify('duck_servo', encode_servo(SERVO_EXIT, 10))
             self.seq += 1
-            self.bridge.notify('duck_command', encode_command(self.seq, 0, DISARM, DEFAULT_DEG))
+            self.bridge.notify('duck_command', encode_command(self.seq, 0, DISARM, self.policy.default_deg))
 
     def status(self):
         now = time.monotonic()
@@ -635,12 +683,17 @@ class Controller:
                 cal_done=list(self.cal_done), cal_hold_pos=CAL_HOLD_POS, raw_mask=self.raw_mask)
             result['control_ready']=bool(fb and fb.imu_ok and now-self.rx_time<.15 and self.mode not in EXCLUSIVE_MODES)
             result['servo_scan_version'] = 2
+            result['roller'] = dict(enabled=self.roller_mode, model=self.roller_policy.file,
+                                    walk_model=self.policy.file, default_deg=self.roller_policy.default_deg,
+                                    action_scale=self.roller_policy.action_scale,
+                                    action_alpha=self.roller_policy.action_alpha,
+                                    action_alpha_head=self.roller_policy.action_alpha_head)
             result['deployment'] = dict(reference='rl/raspi_deploy', control_hz=50,
-                home_deg=HOME_DEG.tolist(), default_deg=DEFAULT_DEG,
+                home_deg=self.policy.home_deg.tolist(), default_deg=self.policy.default_deg,
                 action_scale=self.policy.action_scale, action_alpha=self.policy.action_alpha,
                 action_alpha_head=self.policy.action_alpha_head,
                 gyro_alpha=self.filter.gyro_alpha, velocity_alpha=self.filter.vel_alpha,
-                gravity_tau_s=GRAVITY_TAU, imu_bias_deg=list(IMU_BIAS_DEG),
+                gravity_tau_s=self.filter.gravity_tau_s, imu_bias_deg=list(IMU_BIAS_DEG),
                 filter_clock='host_receive', snapshot='latest')
             result['recovery'] = self.recovery.status()
             result['recovery']['active'] = self.mode in ('shadow','policy')
