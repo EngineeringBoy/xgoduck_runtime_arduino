@@ -67,6 +67,7 @@ class State:
     grav: List[float] = field(default_factory=lambda: [0.0, 0.0, -1.0])
     gyro_rad: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
+
 def _rotate_imu_bias(vec: List[float]) -> List[float]:
     """Rotate an IMU vector to cancel IMU_BIAS_DEG. Identity when the bias is zero."""
     roll, pitch, yaw = IMU_BIAS_DEG
@@ -99,8 +100,10 @@ class ImuFilter:
         self._vel: Optional[List[float]] = None
 
     def update(self, st: State, dt: float = FEEDBACK_PERIOD) -> State:
-        acc_n = _rotate_imu_bias([st.acc[2], -st.acc[0], -st.acc[1]])
-        gyro_n = _rotate_imu_bias([st.gyro[2], -st.gyro[0], -st.gyro[1]])
+        # Keep one policy-frame conversion only. The receive-side filter already
+        # normalizes the raw QMI sample into the body frame expected by the ONNX policy.
+        acc_n = _rotate_imu_bias(list(st.acc))
+        gyro_n = _rotate_imu_bias(list(st.gyro))
         norm = math.sqrt(sum(v * v for v in acc_n))
         acc_unit = [v / norm for v in acc_n] if norm > 1e-6 else None
         # Large gaps cannot be reconstructed from a single angular-rate sample.
@@ -135,11 +138,13 @@ class ImuFilter:
         st.vels = list(self._vel)
         return st
 
+
 def policy_from_state(st: State, home_deg=HOME_DEG) -> Tuple[np.ndarray, np.ndarray]:
     """Absolute joint degrees minus the home pose, then converted to radians."""
     q_deg = np.asarray(st.angles, dtype=np.float32)[POLICY_INDEX]
     v_deg = np.asarray(st.vels, dtype=np.float32)[POLICY_INDEX]
     return np.deg2rad(q_deg - home_deg), np.deg2rad(v_deg)
+
 
 def build_obs(
     st: State,
@@ -159,8 +164,9 @@ def build_obs(
     obs[55:61] = 0.0
     return obs
 
+
 def action_to_deg(action: np.ndarray, mouth_deg: float = 0.0, *, home_deg=HOME_DEG,
-                  action_scale=ACTION_SCALE) -> List[float]:
+                   action_scale=ACTION_SCALE) -> List[float]:
     """Policy output is radians relative to home. Convert to degrees and add the home pose."""
     q_deg = home_deg + np.rad2deg(action_scale * action)
     targets = np.zeros(len(MOTOR_IDS), dtype=np.float32)

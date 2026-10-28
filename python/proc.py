@@ -44,10 +44,10 @@ class SignalFilter:
         if self._last_t is None:
             self._imu = ImuFilter(self.gyro_alpha, self.vel_alpha, self.gravity_tau_s)
         self._last_t = now
-        # QMI firmware already outputs policy body axes. Invert the ESP32 Python
-        # mapping [z,-x,-y] here so ImuFilter applies it exactly once overall.
-        st = State([-acc[1], -acc[2], acc[0]], [-gyro[1], -gyro[2], gyro[0]],
-                   list(angles_deg), list(vels_deg))
+        # The raw QMI data is already in the policy body frame. Keep one conversion
+        # here, and do not flip the axes again in rl_core.py or the policy will see a
+        # spurious backward tilt and keep correcting toward the rear.
+        st = State(list(acc), list(gyro), list(angles_deg), list(vels_deg))
         st = self._imu.update(st, dt)
         out = dict(angles_deg=list(angles_deg), vels_deg=list(st.vels),
                    grav=st.grav, gyro_rad=st.gyro_rad,
